@@ -343,6 +343,10 @@ impl Agent {
             let mut usage_cache_creation: Option<u64> = None;
             let mut saw_message_end = false;
             let mut stop_reason: Option<String> = None;
+            // True once a single block of free text hit `DEGENERATE_TEXT_BYTE_CAP`
+            // and the remainder of the stream was no longer accumulated/forwarded.
+            // Used to log the cap crossing once instead of on every remaining delta.
+            let mut degenerate_capped = false;
             let mut sdk_tool_results: std::collections::HashMap<String, (String, bool)> =
                 std::collections::HashMap::new();
             let provider_name = self.provider.name().to_string();
@@ -523,29 +527,48 @@ impl Agent {
                                 duration_secs: None,
                             });
                         }
-                        text_content.push_str(&text);
-                        if inline_output_tap {
-                            self.inline_tail.set_live(&text_content);
-                            if inline_tap_last.elapsed() >= std::time::Duration::from_millis(200) {
-                                inline_tap_last = Instant::now();
-                                self.publish_inline_tail();
+                        // Hard-bound a single block of free text. Past the cap we
+                        // stop accumulating/forwarding so a runaway response can't
+                        // reach the provider's own `stop_reason: length` limit and
+                        // can never be fed back via a continuation prompt. The
+                        // turn-end degenerate check below then ends the turn and
+                        // surfaces a notice instead of continuing it.
+                        if text_content.len() < Self::DEGENERATE_TEXT_BYTE_CAP {
+                            text_content.push_str(&text);
+                            if inline_output_tap {
+                                self.inline_tail.set_live(&text_content);
+                                if inline_tap_last.elapsed()
+                                    >= std::time::Duration::from_millis(200)
+                                {
+                                    inline_tap_last = Instant::now();
+                                    self.publish_inline_tail();
+                                }
                             }
-                        }
-                        if !text_wrapped_detected {
-                            // Scan only the new delta (plus a short overlap for
-                            // markers straddling the boundary) instead of the
-                            // whole accumulated response on every token.
-                            if let Some(marker_idx) =
-                                find_wrap_marker_incremental(&text_content, text.len())
+                            if !text_wrapped_detected {
+                                // Scan only the new delta (plus a short overlap for
+                                // markers straddling the boundary) instead of the
+                                // whole accumulated response on every token.
+                                if let Some(marker_idx) =
+                                    find_wrap_marker_incremental(&text_content, text.len())
+                                {
+                                    text_wrapped_detected = true;
+                                    let clean_prefix =
+                                        text_content[..marker_idx].trim_end().to_string();
+                                    let _ = event_tx
+                                        .send(ServerEvent::TextReplace { text: clean_prefix });
+                                } else {
+                                    let _ = event_tx
+                                        .send(ServerEvent::TextDelta { text: text.clone() });
+                                }
+                            }
+                            if text_content.len() >= Self::DEGENERATE_TEXT_BYTE_CAP
+                                && !degenerate_capped
                             {
-                                text_wrapped_detected = true;
-                                let clean_prefix =
-                                    text_content[..marker_idx].trim_end().to_string();
-                                let _ =
-                                    event_tx.send(ServerEvent::TextReplace { text: clean_prefix });
-                            } else {
-                                let _ =
-                                    event_tx.send(ServerEvent::TextDelta { text: text.clone() });
+                                degenerate_capped = true;
+                                logging::warn(&format!(
+                                    "Streaming text hit DEGENERATE_TEXT_BYTE_CAP ({} bytes); discarding remainder of this text block",
+                                    text_content.len()
+                                ));
                             }
                         }
                         if self.is_graceful_shutdown() {
@@ -1167,44 +1190,63 @@ impl Agent {
                 {
                     continue;
                 }
-                match self.handle_streaming_no_tool_calls(
-                    stop_reason.as_deref(),
-                    &mut incomplete_continuations,
-                )? {
-                    NoToolCallOutcome::Break => {
-                        // Surface silent guardrail/refusal stops: the provider
-                        // ended the turn with no visible output (e.g. Anthropic
-                        // stop_reason "refusal", or a reasoning-only response).
-                        // Only when the provider actually finished the message
-                        // (saw_message_end) and the user did not cancel, so
-                        // interrupted turns never show a spurious notice.
-                        if saw_message_end
-                            && !self.is_graceful_shutdown()
-                            && let Some(notice) = Self::provider_guardrail_notice(
-                                stop_reason.as_deref(),
-                                text_content.trim().is_empty(),
-                                !reasoning_content.trim().is_empty(),
-                            )
-                        {
-                            logging::warn(&format!(
-                                "{}: turn ended with no visible output (stop_reason={:?}, reasoning_chars={})",
-                                Self::empty_turn_log_event(stop_reason.as_deref()),
-                                stop_reason,
-                                reasoning_content.len()
-                            ));
-                            let _ = event_tx.send(ServerEvent::ProviderGuardrail {
-                                stop_reason: stop_reason.clone(),
-                                message: notice,
-                            });
+                if let Some(notice) = Self::degenerate_output_notice(&text_content) {
+                    // Never hand a degenerate (repeated-literal or oversized,
+                    // tool-free) turn back to the model: continuing it is exactly
+                    // what turns a one-off glitch into an amplification loop.
+                    logging::warn(&format!(
+                        "Streaming turn ended with degenerate output; not continuing: {}",
+                        notice
+                    ));
+                    let _ = event_tx.send(ServerEvent::ProviderGuardrail {
+                        stop_reason: stop_reason.clone(),
+                        message: notice,
+                    });
+                    // End the turn here (like `NoToolCallOutcome::Break`): with no
+                    // tool calls and no continuation, falling through would wrap the
+                    // outer loop and re-stream the model with the degenerate output
+                    // back in context, restarting the loop.
+                    break;
+                } else {
+                    match self.handle_streaming_no_tool_calls(
+                        stop_reason.as_deref(),
+                        &mut incomplete_continuations,
+                    )? {
+                        NoToolCallOutcome::Break => {
+                            // Surface silent guardrail/refusal stops: the provider
+                            // ended the turn with no visible output (e.g. Anthropic
+                            // stop_reason "refusal", or a reasoning-only response).
+                            // Only when the provider actually finished the message
+                            // (saw_message_end) and the user did not cancel, so
+                            // interrupted turns never show a spurious notice.
+                            if saw_message_end
+                                && !self.is_graceful_shutdown()
+                                && let Some(notice) = Self::provider_guardrail_notice(
+                                    stop_reason.as_deref(),
+                                    text_content.trim().is_empty(),
+                                    !reasoning_content.trim().is_empty(),
+                                )
+                            {
+                                logging::warn(&format!(
+                                    "{}: turn ended with no visible output (stop_reason={:?}, reasoning_chars={})",
+                                    Self::empty_turn_log_event(stop_reason.as_deref()),
+                                    stop_reason,
+                                    reasoning_content.len()
+                                ));
+                                let _ = event_tx.send(ServerEvent::ProviderGuardrail {
+                                    stop_reason: stop_reason.clone(),
+                                    message: notice,
+                                });
+                            }
+                            break;
                         }
-                        break;
-                    }
-                    NoToolCallOutcome::ContinueWithoutEvent => continue,
-                    NoToolCallOutcome::ContinueWithSoftInterrupt { injected, point } => {
-                        for event in Self::build_soft_interrupt_events(injected, point, None) {
-                            let _ = event_tx.send(event);
+                        NoToolCallOutcome::ContinueWithoutEvent => continue,
+                        NoToolCallOutcome::ContinueWithSoftInterrupt { injected, point } => {
+                            for event in Self::build_soft_interrupt_events(injected, point, None) {
+                                let _ = event_tx.send(event);
+                            }
+                            continue;
                         }
-                        continue;
                     }
                 }
             }

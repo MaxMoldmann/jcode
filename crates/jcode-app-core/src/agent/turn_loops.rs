@@ -843,7 +843,18 @@ impl Agent {
                 )? {
                     continue;
                 }
-                if self.maybe_continue_incomplete_response(
+                if let Some(notice) = Self::degenerate_output_notice(&text_content) {
+                    // Never hand a degenerate (repeated-literal or oversized,
+                    // tool-free) turn back to the model: continuing it is exactly
+                    // what turns a one-off glitch into an amplification loop.
+                    logging::warn(&format!(
+                        "Turn ended with degenerate output; not continuing: {}",
+                        notice
+                    ));
+                    if print_output {
+                        println!("\n[degenerate output] {}", notice);
+                    }
+                } else if self.maybe_continue_incomplete_response(
                     stop_reason.as_deref(),
                     &mut incomplete_continuations,
                 )? {

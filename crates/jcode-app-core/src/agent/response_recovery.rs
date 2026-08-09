@@ -1,5 +1,22 @@
 use super::*;
 
+/// Why assembled assistant text output was classified as degenerate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DegenerateKind {
+    /// A single short literal repeated a large number of times.
+    Repeated,
+    /// The block exceeded `DEGENERATE_TEXT_BYTE_CAP`.
+    Oversized,
+    /// Normal output; no degeneracy detected.
+    None,
+}
+
+impl DegenerateKind {
+    pub(crate) fn is_degenerate(self) -> bool {
+        !matches!(self, DegenerateKind::None)
+    }
+}
+
 impl Agent {
     fn parse_text_wrapped_tool_call(
         text: &str,
@@ -276,6 +293,96 @@ impl Agent {
         Ok(true)
     }
 
+    /// Lower bound on a text block before we inspect it for repeated-literal
+    /// degeneracy. Short strings naturally contain repeated characters and
+    /// words, so only a substantial run is treated as a suspicious literal
+    /// repeat.
+    pub(crate) const DEGENERATE_REPEAT_MIN_BYTES: usize = 4096;
+
+    /// Largest repeating unit (in bytes) we consider a "literal" run. A genuine
+    /// degenerate literal is short (a marker, a tag, a word) repeated many
+    /// times; bounding the unit keeps detection cheap and avoids flagging large
+    /// non-repeating content.
+    const DEGENERATE_REPEAT_MAX_PERIOD: usize = 64;
+
+    /// Hard cap on a single assistant text block. Assembled free-text output at
+    /// or above this size is treated as degenerate regardless of content, so a
+    /// runaway response is bounded well below the provider's own
+    /// `stop_reason: length` limit and is never fed back via a continuation
+    /// prompt.
+    pub(crate) const DEGENERATE_TEXT_BYTE_CAP: usize = 256 * 1024;
+
+    /// Classify assembled assistant text output as degenerate or normal.
+    ///
+    /// `Repeated` fires when `text` is a single short literal repeated many
+    /// times (the canonical failure is a model echoing a marker like
+    /// `<placeholder></placeholder>` thousands of times instead of emitting a
+    /// real tool call). `Oversized` fires when a single block exceeds
+    /// `DEGENERATE_TEXT_BYTE_CAP`. Everything else is `None`.
+    pub(crate) fn classify_degenerate_output(text: &str) -> DegenerateKind {
+        let bytes = text.trim();
+        if bytes.is_empty() {
+            return DegenerateKind::None;
+        }
+        if bytes.len() >= Self::DEGENERATE_TEXT_BYTE_CAP {
+            return DegenerateKind::Oversized;
+        }
+        if bytes.len() >= Self::DEGENERATE_REPEAT_MIN_BYTES
+            && Self::is_degenerate_literal_run(bytes)
+        {
+            return DegenerateKind::Repeated;
+        }
+        DegenerateKind::None
+    }
+
+    /// True when `text` is composed of a short unit repeated end-to-end (a
+    /// "literal" run). A trailing partial unit is tolerated; the run must cover
+    /// the whole buffer so ordinary prose with a few repeated words isn't
+    /// mistaken for a repeat.
+    fn is_degenerate_literal_run(text: &str) -> bool {
+        let bytes = text.as_bytes();
+        let len = bytes.len();
+        let max_period = Self::DEGENERATE_REPEAT_MAX_PERIOD.min(len);
+        for period in 1..=max_period {
+            let full_units = len / period;
+            // Too few repeats to distinguish a run from ordinary output.
+            if full_units < 8 {
+                continue;
+            }
+            // Check periodicity over the full units, tolerating a short trailing
+            // partial unit. Early-exit on the first mismatch.
+            let periodic_len = full_units * period;
+            let mut ok = true;
+            for i in 0..periodic_len {
+                if bytes[i] != bytes[i % period] {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Human-facing notice when a turn's assembled text output is degenerate and
+    /// the harness chooses not to hand it back to the model. Returns `None` for
+    /// normal output.
+    pub(crate) fn degenerate_output_notice(text: &str) -> Option<String> {
+        match Self::classify_degenerate_output(text) {
+            DegenerateKind::Oversized => Some(format!(
+                "The model produced a very large text block ({:.1} KiB) with no tool call. Its turn was not continued.",
+                text.trim().len() as f64 / 1024.0
+            )),
+            DegenerateKind::Repeated => Some(format!(
+                "The model kept repeating the same short literal instead of making progress ({} bytes of repeated text). Its turn was not continued.",
+                text.trim().len()
+            )),
+            DegenerateKind::None => None,
+        }
+    }
+
     fn continuation_prompt_for_stop_reason(stop_reason: &str) -> String {
         format!(
             "[System reminder: your previous response ended before completion (stop_reason: {}). Continue exactly where you left off, do not repeat completed content, and if the next step is a tool call, emit the tool call now.]",
@@ -404,5 +511,70 @@ impl Agent {
                 self.persist_session_best_effort("truncated tool-call repair");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_normal_output_is_not_degenerate() {
+        assert_eq!(Agent::classify_degenerate_output("Here is a normal answer."), DegenerateKind::None);
+        assert_eq!(Agent::classify_degenerate_output("hello world"), DegenerateKind::None);
+        assert_eq!(Agent::classify_degenerate_output(""), DegenerateKind::None);
+        assert_eq!(Agent::classify_degenerate_output("   \n  "), DegenerateKind::None);
+    }
+
+    #[test]
+    fn large_varied_output_is_not_flagged_repeated() {
+        // Distinct prose of substantial size must never be classified as a
+        // repeated-literal run.
+        let mut s = String::with_capacity(16384);
+        for i in 0..200 {
+            s.push_str(&format!(
+                "Sentence number {} with enough distinct words to look like real output that is not a loop. ",
+                i
+            ));
+        }
+        assert!(s.len() >= Agent::DEGENERATE_REPEAT_MIN_BYTES);
+        assert_eq!(Agent::classify_degenerate_output(&s), DegenerateKind::None);
+    }
+
+    #[test]
+    fn repeated_placeholder_literal_is_degenerate() {
+        let lit = "<placeholder></placeholder>";
+        let text = lit.repeat(200); // ~4.8 KB, far below the size cap
+        assert!(text.len() >= Agent::DEGENERATE_REPEAT_MIN_BYTES);
+        assert_eq!(Agent::classify_degenerate_output(&text), DegenerateKind::Repeated);
+        assert!(Agent::classify_degenerate_output(&text).is_degenerate());
+        assert!(Agent::degenerate_output_notice(&text).is_some());
+    }
+
+    #[test]
+    fn small_repeated_literal_is_not_classified() {
+        // A few repeats don't meet the minimum-size bar and are harmless.
+        let text = "<placeholder></placeholder>".repeat(4);
+        assert!(text.len() < Agent::DEGENERATE_REPEAT_MIN_BYTES);
+        assert_eq!(Agent::classify_degenerate_output(&text), DegenerateKind::None);
+    }
+
+    #[test]
+    fn oversized_block_is_degenerate_even_if_not_repeated() {
+        // Gigantic (but not repeated) output still trips the size cap.
+        let mut text = String::with_capacity(Agent::DEGENERATE_TEXT_BYTE_CAP + 1024);
+        let mut i = 0usize;
+        while text.len() < Agent::DEGENERATE_TEXT_BYTE_CAP + 1 {
+            text.push_str(&format!("segment-{};", i));
+            i += 1;
+        }
+        assert_eq!(Agent::classify_degenerate_output(&text), DegenerateKind::Oversized);
+        assert!(Agent::classify_degenerate_output(&text).is_degenerate());
+        assert!(Agent::degenerate_output_notice(&text).is_some());
+    }
+
+    #[test]
+    fn notice_is_absent_for_normal_output() {
+        assert!(Agent::degenerate_output_notice("a normal short answer").is_none());
     }
 }
