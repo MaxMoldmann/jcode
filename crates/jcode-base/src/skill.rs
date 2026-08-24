@@ -27,7 +27,35 @@ struct SkillFrontmatter {
     name: String,
     description: String,
     #[serde(rename = "allowed-tools")]
-    allowed_tools: Option<String>,
+    allowed_tools: Option<AllowedTools>,
+}
+
+/// `allowed-tools` accepts either an inline comma-separated scalar
+/// (`allowed-tools: Read, Write`) or a YAML sequence (`- Read`). Authors use
+/// both forms interchangeably, and rejecting either one silently hides the
+/// whole skill from the registry.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum AllowedTools {
+    Scalar(String),
+    List(Vec<String>),
+}
+
+impl AllowedTools {
+    fn into_tools(self) -> Vec<String> {
+        match self {
+            Self::Scalar(value) => value
+                .split(',')
+                .map(|tool| tool.trim().to_string())
+                .filter(|tool| !tool.is_empty())
+                .collect(),
+            Self::List(values) => values
+                .into_iter()
+                .map(|tool| tool.trim().to_string())
+                .filter(|tool| !tool.is_empty())
+                .collect(),
+        }
+    }
 }
 
 /// Registry of available skills
@@ -464,10 +492,18 @@ impl SkillRegistry {
 
             if path.is_dir() {
                 let skill_file = path.join("SKILL.md");
-                if skill_file.exists()
-                    && let Ok(skill) = Self::parse_skill(&skill_file)
-                {
-                    self.skills.insert(skill.name.clone(), skill);
+                if skill_file.exists() {
+                    match Self::parse_skill(&skill_file) {
+                        Ok(skill) => {
+                            self.skills.insert(skill.name.clone(), skill);
+                        }
+                        Err(error) => {
+                            jcode_logging::warn(&format!(
+                                "skipping skill with unreadable SKILL.md frontmatter: {} ({error})",
+                                skill_file.display()
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -499,8 +535,7 @@ impl SkillRegistry {
             allowed_tools,
         } = frontmatter;
 
-        let allowed_tools =
-            allowed_tools.map(|s| s.split(',').map(|t| t.trim().to_string()).collect());
+        let allowed_tools = allowed_tools.map(AllowedTools::into_tools);
         let search_text = build_skill_search_text(&name, &description, &body);
 
         Ok(Skill {
@@ -979,6 +1014,50 @@ mod tests {
         let path = dir.join("SKILL.md");
         std::fs::write(&path, content).expect("write skill");
         path
+    }
+
+    #[test]
+    fn loads_skills_whose_allowed_tools_use_a_yaml_sequence() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let dir = temp.path().join("hamburger-method");
+        std::fs::create_dir_all(&dir).expect("create skill dir");
+        std::fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: hamburger-method\ndescription: Slices work.\nallowed-tools:\n  - Read\n  - AskUserQuestion\n---\n\nSlice it.\n",
+        )
+        .expect("write skill");
+
+        let mut registry = SkillRegistry::default();
+        registry.load_from_dir(temp.path()).expect("load skills");
+
+        let skill = registry
+            .get("hamburger-method")
+            .expect("sequence allowed-tools should still register the skill");
+        assert_eq!(
+            skill.allowed_tools.as_deref(),
+            Some(&["Read".to_string(), "AskUserQuestion".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn loads_skills_whose_allowed_tools_use_an_inline_scalar() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let dir = temp.path().join("inline-tools");
+        std::fs::create_dir_all(&dir).expect("create skill dir");
+        std::fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: inline-tools\ndescription: Inline form.\nallowed-tools: Read, AskUserQuestion\n---\n\nInline.\n",
+        )
+        .expect("write skill");
+
+        let mut registry = SkillRegistry::default();
+        registry.load_from_dir(temp.path()).expect("load skills");
+
+        let skill = registry.get("inline-tools").expect("skill should register");
+        assert_eq!(
+            skill.allowed_tools.as_deref(),
+            Some(&["Read".to_string(), "AskUserQuestion".to_string()][..])
+        );
     }
 
     #[test]
