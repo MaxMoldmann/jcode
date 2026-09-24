@@ -20,6 +20,7 @@ use jcode_provider_copilot::{
     build_messages as build_copilot_messages, build_tools as build_copilot_tools,
 };
 use jcode_provider_copilot::{DEFAULT_MODEL, FALLBACK_MODELS};
+use jcode_provider_openai::stream::parse_openai_response_event;
 pub use jcode_provider_core::PremiumMode;
 use jcode_provider_core::{EventStream, Provider};
 use serde_json::{Value, json};
@@ -53,6 +54,9 @@ pub struct CopilotApiProvider {
     user_turn_count: Arc<std::sync::atomic::AtomicU64>,
     reasoning_effort: Arc<RwLock<Option<String>>>,
     created_at: std::time::Instant,
+    /// Set of model IDs that must be routed to /responses (not /chat/completions).
+    /// Populated from the Copilot /models catalog's `supported_endpoints` field.
+    responses_model_ids: Arc<RwLock<std::collections::HashSet<String>>>,
 }
 
 /// Reasoning efforts supported by Copilot's claude-sonnet-5 route,
@@ -177,6 +181,7 @@ impl CopilotApiProvider {
             user_turn_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             reasoning_effort: Arc::new(RwLock::new(None)),
             created_at: std::time::Instant::now(),
+            responses_model_ids: Arc::new(RwLock::new(std::collections::HashSet::new())),
         };
         provider.seed_cached_catalog();
         Ok(provider)
@@ -213,6 +218,7 @@ impl CopilotApiProvider {
             user_turn_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             reasoning_effort: Arc::new(RwLock::new(None)),
             created_at: std::time::Instant::now(),
+            responses_model_ids: Arc::new(RwLock::new(std::collections::HashSet::new())),
         };
         provider.seed_cached_catalog();
         provider
@@ -345,6 +351,20 @@ impl CopilotApiProvider {
                     .filter(|m| m.model_picker_enabled)
                     .map(|m| m.id.clone())
                     .collect();
+                // Track which models need /responses routing.
+                let responses_ids: std::collections::HashSet<String> = models
+                    .iter()
+                    .filter(|m| m.needs_responses_api())
+                    .map(|m| m.id.clone())
+                    .collect();
+                jcode_base::logging::info(&format!(
+                    "Copilot catalog: {} responses-only models: [{}]",
+                    responses_ids.len(),
+                    responses_ids.iter().cloned().collect::<Vec<_>>().join(", ")
+                ));
+                if let Ok(mut ids) = self.responses_model_ids.try_write() {
+                    *ids = responses_ids;
+                }
                 let all_ids: Vec<String> = models.iter().map(|m| m.id.clone()).collect();
                 let default = copilot_auth::choose_default_model(&models);
                 jcode_base::logging::info(&format!(
@@ -398,6 +418,16 @@ impl CopilotApiProvider {
             .store(true, std::sync::atomic::Ordering::Release);
         self.init_ready.notify_waiters();
         jcode_base::bus::Bus::global().publish_models_updated();
+    }
+
+    /// Returns true when `model` should be routed to `/responses` rather
+    /// than `/chat/completions`. Falls back to `false` (chat/completions) for
+    /// models not seen in the catalog (safe default for older entries).
+    fn model_needs_responses_api(&self, model: &str) -> bool {
+        self.responses_model_ids
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(model)
     }
 
     pub fn complete_init_without_tier_detection(&self) {
@@ -508,6 +538,10 @@ impl CopilotApiProvider {
                 }
             };
 
+            // Route to /responses (OpenAI Responses API) for grok and other
+            // models that are not accessible via /chat/completions.
+            let use_responses_api = self.model_needs_responses_api(&model);
+
             let request_id = Uuid::new_v4().to_string();
 
             // Retries use a fresh unpooled client: the fault that broke
@@ -520,6 +554,147 @@ impl CopilotApiProvider {
             } else {
                 jcode_provider_core::fresh_transport_client()
             };
+
+            if use_responses_api {
+                // Build Responses API request from the pre-built chat messages.
+                // Re-derive from the original messages via build_responses_input.
+                // (messages here is already the chat-format Vec<Value>; we pass
+                // a sentinel None system and rebuild from the raw messages field.)
+                // For the Responses API, rebuild input from the raw messages (already chat-format Vec<Value>).
+                // The key difference: use /responses endpoint with Responses API format.
+                let instructions = messages
+                    .first()
+                    .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
+                    .and_then(|m| m.get("content").and_then(|c| c.as_str()))
+                    .unwrap_or("")
+                    .to_string();
+                // Build the non-system messages as input items for the Responses API.
+                let api_input: Vec<Value> = messages.iter().skip(
+                    if messages.first().map(|m| m.get("role").and_then(|r| r.as_str()) == Some("system")).unwrap_or(false) { 1 } else { 0 }
+                ).map(|m| {
+                    let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+                    match role {
+                        "assistant" => {
+                            let mut parts = Vec::new();
+                            if let Some(content) = m.get("content").and_then(|c| c.as_str()) {
+                                if !content.is_empty() {
+                                    parts.push(json!({"type": "output_text", "text": content}));
+                                }
+                            }
+                            if let Some(tool_calls) = m.get("tool_calls").and_then(|tc| tc.as_array()) {
+                                for tc in tool_calls {
+                                    let fn_obj = tc.get("function");
+                                    parts.push(json!({
+                                        "type": "function_call",
+                                        "call_id": tc.get("id").and_then(|i| i.as_str()).unwrap_or(""),
+                                        "name": fn_obj.and_then(|f| f.get("name")).and_then(|n| n.as_str()).unwrap_or(""),
+                                        "arguments": fn_obj.and_then(|f| f.get("arguments")).and_then(|a| a.as_str()).unwrap_or("{}"),
+                                    }));
+                                }
+                            }
+                            json!({"type": "message", "role": "assistant", "content": parts})
+                        }
+                        "tool" => {
+                            json!({
+                                "type": "function_call_output",
+                                "call_id": m.get("tool_call_id").and_then(|id| id.as_str()).unwrap_or(""),
+                                "output": m.get("content").and_then(|c| c.as_str()).unwrap_or(""),
+                            })
+                        }
+                        _ => {
+                            // user message
+                            let text = m.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                            json!({
+                                "type": "message",
+                                "role": "user",
+                                "content": [{"type": "input_text", "text": text}]
+                            })
+                        }
+                    }
+                }).collect();
+
+                // Build the tools in Responses API format.
+                let api_tools: Vec<Value> = tools.iter().map(|t| {
+                    if let Some(func) = t.get("function") {
+                        json!({
+                            "type": "function",
+                            "name": func.get("name").and_then(|n| n.as_str()).unwrap_or(""),
+                            "description": func.get("description").and_then(|d| d.as_str()).unwrap_or(""),
+                            "parameters": func.get("parameters").cloned().unwrap_or(json!({})),
+                        })
+                    } else {
+                        t.clone()
+                    }
+                }).collect();
+
+                let mut body = json!({
+                    "model": model,
+                    "instructions": instructions,
+                    "input": api_input,
+                    "stream": true,
+                    "store": false,
+                });
+                if !api_tools.is_empty() {
+                    body["tools"] = json!(api_tools);
+                    body["tool_choice"] = json!("auto");
+                }
+                body["max_output_tokens"] = json!(max_tokens);
+
+                let resp = attempt_client
+                    .post(format!("{}/responses", copilot_auth::COPILOT_API_BASE))
+                    .header("Authorization", format!("Bearer {}", bearer_token))
+                    .header("Editor-Version", copilot_auth::EDITOR_VERSION)
+                    .header("Editor-Plugin-Version", copilot_auth::EDITOR_PLUGIN_VERSION)
+                    .header("Copilot-Integration-Id", copilot_auth::COPILOT_INTEGRATION_ID)
+                    .header("Content-Type", "application/json")
+                    .header("X-Request-Id", &request_id)
+                    .header("X-GitHub-Api-Version", COPILOT_API_VERSION)
+                    .header("Vscode-Sessionid", &self.session_id)
+                    .header("Vscode-Machineid", &self.machine_id)
+                    .json(&body)
+                    .send()
+                    .await;
+
+                let resp = match resp {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = tx.send(Err(anyhow::anyhow!("Copilot Responses API request failed: {}", e))).await;
+                        return;
+                    }
+                };
+
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let body_text = jcode_base::util::http_error_body(resp, "HTTP error").await;
+                    let _ = tx.send(Err(anyhow::anyhow!("Copilot API error (HTTP {}): {}", status, body_text))).await;
+                    return;
+                }
+
+                let _ = tx.send(Ok(StreamEvent::ConnectionType {
+                    connection: format!("copilot-responses-api ({})", model),
+                })).await;
+
+                // Parse using the standard OpenAI Responses API SSE parser.
+                match self.process_responses_sse_stream(resp, tx.clone()).await {
+                    Ok(()) => return,
+                    Err(e) => {
+                        let _ = tx.send(Err(e)).await;
+                        return;
+                    }
+                }
+            }
+
+            let mut body = json!({
+                "model": model,
+                "messages": messages,
+                "stream": true,
+            });
+            Self::add_max_token_parameter(&mut body, &model, max_tokens);
+            self.add_reasoning_effort_parameter(&mut body, &model);
+
+            if !tools.is_empty() {
+                body["tools"] = json!(tools);
+            }
 
             let resp = attempt_client
                 .post(format!(
@@ -910,6 +1085,79 @@ impl CopilotApiProvider {
             .await;
         Ok(())
     }
+
+    async fn process_responses_sse_stream(
+        &self,
+        resp: reqwest::Response,
+        tx: mpsc::Sender<Result<StreamEvent>>,
+    ) -> Result<()> {
+        use futures::StreamExt;
+        use std::collections::{HashMap, HashSet, VecDeque};
+
+        let sse_chunk_timeout = jcode_base::provider::stream_idle_timeout();
+        let mut stream = resp.bytes_stream();
+        let mut buffer = String::new();
+        let mut saw_text_delta = false;
+        let mut saw_thinking_delta = false;
+        let mut streaming_tool_calls: HashMap<String, jcode_provider_openai::stream::StreamingToolCallState> = HashMap::new();
+        let mut completed_tool_items: HashSet<String> = HashSet::new();
+        let mut pending: VecDeque<StreamEvent> = VecDeque::new();
+
+        loop {
+            let chunk = match tokio::time::timeout(sse_chunk_timeout, stream.next()).await {
+                Ok(Some(Ok(c))) => c,
+                Ok(Some(Err(e))) => anyhow::bail!("Responses stream error: {}", e),
+                Ok(None) => break,
+                Err(_) => anyhow::bail!(
+                    "Responses stream read timeout: no data received for {} seconds",
+                    sse_chunk_timeout.as_secs()
+                ),
+            };
+
+            buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+            while let Some(line_end) = buffer.find('\n') {
+                let line = buffer[..line_end].trim_end_matches('\r').to_string();
+                buffer = buffer[line_end + 1..].to_string();
+
+                if line.is_empty() || line.starts_with(':') || line.starts_with("event:") {
+                    continue;
+                }
+
+                if let Some(data) = jcode_base::util::sse_data_line(&line) {
+                    if let Some(event) = parse_openai_response_event(
+                        data,
+                        &mut saw_text_delta,
+                        &mut saw_thinking_delta,
+                        &mut streaming_tool_calls,
+                        &mut completed_tool_items,
+                        &mut pending,
+                    ) {
+                        match &event {
+                            StreamEvent::MessageEnd { .. } => {
+                                let _ = tx.send(Ok(event)).await;
+                                return Ok(());
+                            }
+                            _ => {
+                                let _ = tx.send(Ok(event)).await;
+                            }
+                        }
+                    }
+                    // Flush any pending events
+                    while let Some(pending_event) = pending.pop_front() {
+                        let is_end = matches!(pending_event, StreamEvent::MessageEnd { .. });
+                        let _ = tx.send(Ok(pending_event)).await;
+                        if is_end {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+
+        let _ = tx.send(Ok(StreamEvent::MessageEnd { stop_reason: None })).await;
+        Ok(())
+    }
 }
 
 fn is_retryable_error(error_str: &str) -> bool {
@@ -1033,6 +1281,7 @@ impl Provider for CopilotApiProvider {
             user_turn_count: self.user_turn_count.clone(),
             reasoning_effort: self.reasoning_effort.clone(),
             created_at: self.created_at,
+            responses_model_ids: self.responses_model_ids.clone(),
         };
 
         tokio::spawn(async move {
@@ -1147,6 +1396,7 @@ impl Provider for CopilotApiProvider {
             user_turn_count: self.user_turn_count.clone(),
             reasoning_effort: self.reasoning_effort.clone(),
             created_at: self.created_at,
+            responses_model_ids: self.responses_model_ids.clone(),
         })
     }
 
